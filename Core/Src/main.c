@@ -43,6 +43,8 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+UART_HandleTypeDef huart4;
+
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -52,6 +54,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_UART4_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -62,12 +65,13 @@ uint16_t joystickdata[2];
 uint8_t flash_mode=0; // 1 = rilasciato, 0 = premuto
 uint16_t discovery_leds[]={GPIO_PIN_9, GPIO_PIN_10, GPIO_PIN_11, GPIO_PIN_12,
                              GPIO_PIN_13, GPIO_PIN_14, GPIO_PIN_15, GPIO_PIN_8};
+char uart_buf[50];
+int buf_len;
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if(GPIO_Pin == joystick_button_Pin)
   {
-    // Leggiamo lo stato attuale del pin
     if (HAL_GPIO_ReadPin(joystick_button_GPIO_Port, joystick_button_Pin) == GPIO_PIN_RESET)
     {
       flash_mode=1;
@@ -111,6 +115,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
+  MX_UART4_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)joystickdata, 2);
@@ -131,11 +136,14 @@ int main(void)
 		  {
 			  GPIOE->ODR &= ~0xFF00;
 
+			  buf_len = sprintf(uart_buf, "%u,%u\n", joystickdata[0], joystickdata[1]);
+			  HAL_UART_Transmit(&huart4, (uint8_t*)uart_buf, buf_len, 100);
+
 			  float x = (float)joystickdata[0] - 2048;
 			  float y = (float)joystickdata[1] - 2048;
 
-			  // Zona morta: agisci solo se il joystick è spostato significativamente
-			  if ((x*x + y*y) > 500000) // Circa il 25% della corsa
+			  //Zona morta
+			  if ((x*x + y*y) > 500000) //Circa il 25% della corsa
 			  {
 				  // Calcolo angolo: atan2f restituisce radianti tra -PI e +PI
 				  float angle = atan2f(y, x) * 180.0f / 3.14159f;
@@ -146,7 +154,6 @@ int main(void)
 				  HAL_GPIO_WritePin(GPIOE, discovery_leds[led_index], GPIO_PIN_SET);
 			  }
 		  }
-
 		  HAL_Delay(20);
   }
   /* USER CODE END 3 */
@@ -160,6 +167,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -185,6 +193,12 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_UART4;
+  PeriphClkInit.Uart4ClockSelection = RCC_UART4CLKSOURCE_PCLK1;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
@@ -266,6 +280,41 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief UART4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART4_Init(void)
+{
+
+  /* USER CODE BEGIN UART4_Init 0 */
+
+  /* USER CODE END UART4_Init 0 */
+
+  /* USER CODE BEGIN UART4_Init 1 */
+
+  /* USER CODE END UART4_Init 1 */
+  huart4.Instance = UART4;
+  huart4.Init.BaudRate = 115200;
+  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.StopBits = UART_STOPBITS_1;
+  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Mode = UART_MODE_TX_RX;
+  huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart4.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart4.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART4_Init 2 */
+
+  /* USER CODE END UART4_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -296,6 +345,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11
