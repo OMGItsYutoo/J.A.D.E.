@@ -60,6 +60,12 @@ void Error_Handler(void);
 #define joystick_button_Pin GPIO_PIN_3
 #define joystick_button_GPIO_Port GPIOA
 #define joystick_button_EXTI_IRQn EXTI3_IRQn
+#define LCD_CS_Pin GPIO_PIN_13
+#define LCD_CS_GPIO_Port GPIOD
+#define LCD_RST_Pin GPIO_PIN_14
+#define LCD_RST_GPIO_Port GPIOD
+#define LCD_DC_Pin GPIO_PIN_15
+#define LCD_DC_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
 
