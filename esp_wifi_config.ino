@@ -18,51 +18,101 @@ const uint16_t dest_port = 2104;      // Porta di destinazione
 WiFiUDP udp;
 const unsigned int localPort = 1104;
 
-// Buffers
-const size_t MAX_IMAGE_SIZE = 65000;
-uint8_t imageBuffer[MAX_IMAGE_SIZE];
-size_t currentImageSize = 0;
-size_t lastFullImageSize = 0; 
-bool isFrameReady = true; // Flag per il web server
+// --- CONFIGURAZIONE RING BUFFER ---
+#define NUM_FRAMES 3
+#define MAX_JPEG_SIZE 25000 // 40KB per frame per non esaurire la RAM dell'ESP32
 
-char packetBuffer[1500];
+// Struttura che rappresenta un singolo "vassoio"
+typedef struct {
+  uint8_t data[MAX_JPEG_SIZE];
+  size_t size;
+  bool ready; 
+} FrameBuffer;
 
-void handleRoot() {
-  WiFiClient client = server.client();
+FrameBuffer ring_buffer[NUM_FRAMES];
+
+// Puntatori logici per la gestione circolare
+volatile uint8_t write_idx = 0; // Dove scrive l'UDP (Producer)
+volatile uint8_t read_idx = 0;  // Da dove legge il Web Server (Consumer)
+
+// Variabili per l'assemblaggio del frame in ricezione
+volatile size_t expected_total_size = 0;
+uint8_t current_receiving_frame_id = 255;
+uint8_t received_chunks_count = 0;
+uint8_t expected_total_chunks = 0;
+bool chunk_received[256] = {false};
+
+void handleUDP() {
+  int packetSize = udp.parsePacket();
   
-  // 1. Invio degli Header per iniziare uno streaming MJPEG
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-  client.println();
-
-  Serial.println("Browser connesso allo streaming");
-
-  while (client.connected()) {
-    // Controlliamo se è pronto un nuovo frame
-    if (isFrameReady && lastFullImageSize > 0) {
-      // 2. Invio del Boundary e dei metadati del frame
-      client.println("--frame");
-      client.println("Content-Type: image/jpeg");
-      client.printf("Content-Length: %d\n\n", lastFullImageSize);
+  while (packetSize > 0) {
+    if (packetSize == 3) {
+      char eof_marker[4];
+      udp.read(eof_marker, 3);
+      eof_marker[3] = '\0';
       
-      // 3. Invio dei dati binari
-      client.write(imageBuffer, lastFullImageSize);
-      client.println();
+      if (strcmp(eof_marker, "EOF") == 0) {
+        
+        if (received_chunks_count == expected_total_chunks && expected_total_chunks > 0) {
+          // --- FRAME VALIDO COMPLETO ---
+          // Lo blocchiamo nel ring buffer e lo segniamo come pronto
+          ring_buffer[write_idx].size = expected_total_size;
+          ring_buffer[write_idx].ready = true;
+          
+          // Avanziamo il puntatore di scrittura al prossimo slot
+          write_idx = (write_idx + 1) % NUM_FRAMES;
+          
+          // Se la scrittura ha raggiunto la lettura (Buffer Pieno/Overflow)
+          // Forziamo l'avanzamento della lettura per sovrascrivere il frame più vecchio
+          if (write_idx == read_idx) {
+            read_idx = (read_idx + 1) % NUM_FRAMES;
+            Serial.println("Buffer pieno: sovrascrittura frame vecchio.");
+          }
+        } else {
+          Serial.printf("Glitch evitato. Ricevuti %d su %d\n", received_chunks_count, expected_total_chunks);
+        }
+      }
+    } 
+    else if (packetSize > 3) {
+      uint8_t header[3];
+      udp.read(header, 3);
       
-      // 4. Reset del flag: aspettiamo che il Core 0 finisca il prossimo frame
-      isFrameReady = false; 
+      uint8_t frame_id = header[0];
+      uint8_t chunk_idx = header[1];
+      uint8_t total_chunks = header[2];
+
+      if (frame_id != current_receiving_frame_id) {
+        current_receiving_frame_id = frame_id;
+        received_chunks_count = 0;
+        expected_total_chunks = total_chunks;
+        expected_total_size = 0;
+        memset(chunk_received, false, sizeof(chunk_received)); 
+      }
+      
+      int payload_len = packetSize - 3;
+      int offset = chunk_idx * 1400; 
+      
+      // Scriviamo i dati direttamente nello slot corrente del ring_buffer
+      if (offset + payload_len < MAX_JPEG_SIZE) {
+        udp.read(&ring_buffer[write_idx].data[offset], payload_len);
+        
+        if (!chunk_received[chunk_idx]) {
+          chunk_received[chunk_idx] = true;
+          received_chunks_count++;
+        }
+        
+        if (offset + payload_len > expected_total_size) {
+            expected_total_size = offset + payload_len;
+        }
+      }
     }
-    
-    // Piccola pausa per non saturare la CPU e permettere ad altri task di girare
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    packetSize = udp.parsePacket(); 
   }
-  
-  Serial.println("Browser disconnesso");
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200, SERIAL_8N1, RXD1, TXD1);
+  Serial1.begin(2000000, SERIAL_8N1, RXD1, TXD1);
 
   // Connessione WiFi
   WiFi.begin(ssid, password);
@@ -77,9 +127,6 @@ void setup() {
 
   udp.begin(localPort);
   Serial.printf("In ascolto su UDP porta %d\n", localPort);
-
-  server.on("/", handleRoot);
-  server.begin();
 
   // Creiamo il Task sul Core 0
   xTaskCreatePinnedToCore(
@@ -105,46 +152,8 @@ void setup() {
 }
 
 void TaskCore0(void * pvParameters) {
-  while(1) {
-    int packetSize = udp.parsePacket();
-    if (packetSize) {
-      int len = udp.read(packetBuffer, sizeof(packetBuffer));
-      
-      if (len > 0) {
-        // 1. Riconoscimento Header Dimensione ("SIZE" + 4 byte = 8 byte)
-        if (len == 8 && strncmp(packetBuffer, "SIZE", 4) == 0) {
-          // Estraiamo i 4 byte successivi a "SIZE" e convertiamoli in uint32_t
-          memcpy(&lastFullImageSize, packetBuffer + 4, 4);
-          
-          currentImageSize = 0;   // Reset buffer per nuovo frame
-          isFrameReady = false;   // Il frame non è più pronto finché non arriva EOF
-          
-          Serial.printf("\n--- NUOVO FRAME --- Attesi: %d bytes\n", lastFullImageSize);
-        } 
-        
-        // 2. Riconoscimento Fine Frame
-        else if (len == 3 && strncmp(packetBuffer, "EOF", 3) == 0) {
-          isFrameReady = true;
-          Serial.printf("FRAME COMPLETATO. Totale ricevuto: %d\n", currentImageSize);
-        } 
-        
-        // 3. Accumulo dati dell'immagine
-        else {
-          if (!isFrameReady && (currentImageSize + len <= MAX_IMAGE_SIZE)) {
-            memcpy(imageBuffer + currentImageSize, packetBuffer, len);
-            currentImageSize += len;
-          }
-        }
-      }
-    }
-    vTaskDelay(1/portTICK_PERIOD_MS);
-  }
-}
 
-void TaskCore1(void * pvParameters){
   while(1){
-    server.handleClient();
-
     if (Serial1.available()) {
       String data = Serial1.readStringUntil('\n');
       
@@ -160,6 +169,46 @@ void TaskCore1(void * pvParameters){
     } 
     vTaskDelay(5/portTICK_PERIOD_MS);
   }
+}
+
+void TaskCore1(void * pvParameters){
+
+  static size_t bytes_sent = 0;
+  const size_t CHUNK_TX_SIZE = 1024;
+
+  while(1) {
+    
+      handleUDP(); // Dreniamo l'hardware continuamente
+      
+      // --- CONTROLLO DEL CONSUMER ---
+      // Se nel vassoio di lettura c'è un frame pronto, lo serviamo
+      if (ring_buffer[read_idx].ready) {
+
+        size_t bytes_left = ring_buffer[read_idx].size - bytes_sent;
+
+        size_t current_chunk_size = (bytes_left > CHUNK_TX_SIZE) ? CHUNK_TX_SIZE : bytes_left;
+
+        size_t byte_inviati = Serial1.write(ring_buffer[read_idx].data, ring_buffer[read_idx].size);
+        if(byte_inviati != ring_buffer[read_idx].size) {
+          Serial.println("Errore trasmissione UART di JPEG!");
+        }
+
+        bytes_sent += current_chunk_size;
+
+        if (bytes_sent >= ring_buffer[read_idx].size) {
+          // "Svuotiamo" il vassoio
+          ring_buffer[read_idx].ready = false;
+          
+          // Avanziamo il puntatore di lettura
+          read_idx = (read_idx + 1) % NUM_FRAMES;
+
+          bytes_sent = 0;
+        }
+      }
+
+    vTaskDelay(1/portTICK_PERIOD_MS);
+  }
+
 }
 
 void loop() {
