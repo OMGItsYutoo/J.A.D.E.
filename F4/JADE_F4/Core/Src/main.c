@@ -68,7 +68,7 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define UART_BUF_SIZE 16384  // Buffer circolare generoso per 2Mbit/s
+#define UART_BUF_SIZE 32768  // Buffer circolare generoso per 2Mbit/s
 #define POOL_SIZE 4096
 
 uint8_t dma_rx_buf[UART_BUF_SIZE];
@@ -90,9 +90,22 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
     }
 }
 
+//uint32_t err=0;
+//
+//void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+//    if (huart->Instance == UART4) {
+//        err = HAL_UART_GetError(huart);
+//        // Se err != 0, qui puoi mettere un breakpoint per vedere che errore è
+//        // Esempio: 1 = Overrun, 2 = Noise, 4 = Framing
+//
+//        // Obbligatorio: riavvia la ricezione se si ferma!
+//        HAL_UART_Receive_DMA(&huart4, dma_rx_buf, UART_BUF_SIZE);
+//    }
+//}
+
 /* --- Funzione di Input per TJpgDec --- */
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
-    size_t read_bytes = 0;
+	size_t read_bytes = 0;
     while (read_bytes < nbyte) {
         // Calcola la posizione attuale del cursore di scrittura DMA
         uint32_t wr_ptr = UART_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_uart4_rx);
@@ -105,7 +118,7 @@ size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
             read_bytes++;
         } else {
             // Se non ci sono dati, aspetta un istante per far respirare la CPU
-            HAL_Delay(1);
+            //HAL_Delay(1);
         }
     }
     return read_bytes;
@@ -113,25 +126,26 @@ size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
 
 /* --- Funzione di Output per TJpgDec --- */
 int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
-    // 1. Imposta la finestra sul display
+	// 1. Imposta la finestra sul display
     LCD_SetWindow(rect->left, rect->top, rect->right, rect->bottom);
-
-    // 2. Comando scrittura RAM (0x2C)
-    uint8_t cmd = 0x2C;
-    LCD_DC_0; // Comando
-    LCD_CS_0;
-    HAL_SPI_Transmit(&hspi1, &cmd, 1, 10);
-    LCD_DC_1; // Dati
 
     // 3. Calcola numero di pixel (SPI a 16 bit invia Half-Words)
     uint32_t num_pixels = (rect->right - rect->left + 1) * (rect->bottom - rect->top + 1);
-
-    // 4. Attendi che il DMA precedente sia libero
-    while (!spi_dma_ready);
-    spi_dma_ready = 0;
+    uint16_t* p = (uint16_t*)bitmap;
+    for(uint32_t i = 0; i < num_pixels; i++) {
+    	uint16_t t = p[i];
+    	p[i] = (t >> 8) | (t << 8);
+    }
 
     // 5. Trasmissione via DMA (passiamo num_pixels perché SPI è 16-bit)
-    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)bitmap, num_pixels);
+    LCD_DC_1; // Dati
+    LCD_CS_0;
+    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)bitmap, num_pixels*2);
+
+    // 4. Attendi che il DMA precedente sia libero
+	while(HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY) {}
+
+	LCD_CS_1;
 
     return 1; // Continua decodifica
 }
@@ -140,6 +154,38 @@ int len;
 int before=0;
 int after=0;
 uint8_t found=0;
+JRESULT res;
+
+#define FILL_BUF_SIZE 512  // byte, deve essere pari
+static uint8_t fill_buf[FILL_BUF_SIZE];
+
+void LCD_FillDMA(uint16_t color, uint32_t num_pixels) {
+    // Riempi il buffer col colore (2 byte per pixel, big-endian)
+    uint8_t hi = color >> 8;
+    uint8_t lo = color & 0xFF;
+    for (int i = 0; i < FILL_BUF_SIZE; i += 2) {
+        fill_buf[i]   = hi;
+        fill_buf[i+1] = lo;
+    }
+
+    uint32_t bytes_remaining = num_pixels * 2;
+
+    LCD_DC_1;
+    LCD_CS_0;
+
+    while (bytes_remaining > 0) {
+        uint32_t chunk = (bytes_remaining > FILL_BUF_SIZE) ? FILL_BUF_SIZE : bytes_remaining;
+
+        spi_dma_ready = 0;
+        HAL_SPI_Transmit_DMA(&hspi1, fill_buf, chunk);
+        while (!spi_dma_ready);  // aspetta fine chunk
+
+        bytes_remaining -= chunk;
+    }
+
+    LCD_CS_1;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -178,10 +224,33 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)joystickdata, 2);
   HAL_UART_Receive_DMA(&huart4, dma_rx_buf, UART_BUF_SIZE);
+
+
+  HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_RESET);
+  HAL_Delay(100);
+  HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_SET);
+  HAL_Delay(200);
+
+  LCD_Init(U2D_L2R, 255);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+  /*while (1) {
+	  LCD_SetWindow(0, 0, 479, 319);
+	  LCD_FillDMA(RED, 480 * 320);
+
+	  HAL_Delay(1000);
+
+	  LCD_SetWindow(0, 0, 479, 319);
+	  	  LCD_FillDMA(BLUE, 480 * 320);
+
+	  	  HAL_Delay(1000);
+
+
+  }*/
+
   while (1)
   {
     /* USER CODE END WHILE */
@@ -209,13 +278,14 @@ int main(void)
 	  else rd_ptr = UART_BUF_SIZE - (2 - rd_ptr);
 
 	  // --- 3. Decompressione ---
-	  JRESULT res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
+	  res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
 	  if (res == JDR_OK) {
 		  // Parametri: oggetto, output_func, scale (0=1/1, 1=1/2, 2=1/4)
 		  jd_decomp(&jdec, out_func, 0);
 	  }
 
 	  // Finito il frame, pulisce i flag e ricomincia a cercare il prossimo header
+	  while (!spi_dma_ready);
 	  LCD_CS_1;
   }
   /* USER CODE END 3 */
@@ -347,7 +417,7 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_16BIT;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
