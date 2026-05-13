@@ -68,7 +68,7 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define UART_BUF_SIZE 32768  // Buffer circolare generoso per 2Mbit/s
+#define UART_BUF_SIZE 65535  // Buffer circolare generoso per 2Mbit/s
 #define POOL_SIZE 4096
 
 uint8_t dma_rx_buf[UART_BUF_SIZE];

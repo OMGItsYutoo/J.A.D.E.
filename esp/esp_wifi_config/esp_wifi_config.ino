@@ -1,13 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <WebServer.h> // Aggiunta per il Web Server
 
 // Configurazione Serial1
 #define RXD1 14
 #define TXD1 15
-
-WebServer server(80);
 
 // Parametri di rete
 const char *ssid = "JADE";
@@ -188,7 +185,7 @@ void TaskCore1(void * pvParameters){
 
         size_t current_chunk_size = (bytes_left > CHUNK_TX_SIZE) ? CHUNK_TX_SIZE : bytes_left;
 
-        size_t byte_inviati = Serial1.write(ring_buffer[read_idx].data, ring_buffer[read_idx].size);
+        size_t byte_inviati = Serial1.write(ring_buffer[read_idx].data+bytes_sent, current_chunk_size);
         if(byte_inviati != ring_buffer[read_idx].size) {
           Serial.println("Errore trasmissione UART di JPEG!");
         }
