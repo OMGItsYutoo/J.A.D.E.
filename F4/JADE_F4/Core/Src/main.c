@@ -70,6 +70,10 @@ static void MX_SPI1_Init(void);
 /* USER CODE BEGIN 0 */
 #define UART_BUF_SIZE 65535  // Buffer circolare generoso per 2Mbit/s
 #define POOL_SIZE 4096
+#define DMA_BLOCK_SIZE 512
+
+uint16_t dma_buf[2][DMA_BLOCK_SIZE];
+volatile uint8_t buf_idx=0;
 
 uint8_t dma_rx_buf[UART_BUF_SIZE];
 uint8_t jdec_pool[POOL_SIZE];     // Memoria di lavoro per il decoder
@@ -86,6 +90,7 @@ int buf_len;
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
     if (hspi == &hspi1) {
+        LCD_CS_1;
         spi_dma_ready = 1;
     }
 }
@@ -119,15 +124,18 @@ int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
     // 3. Calcola numero di pixel (SPI a 16 bit invia Half-Words)
     uint32_t num_pixels = (rect->right - rect->left + 1) * (rect->bottom - rect->top + 1);
 
-    // 5. Trasmissione via DMA (passiamo num_pixels perché SPI è 16-bit)
-    LCD_DC_1; // Dati
-    LCD_CS_0;
-    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)bitmap, num_pixels);
+	// Salva indice buffer PRIMA di switchare
+	uint8_t current_buf = buf_idx;
+	memcpy(dma_buf[current_buf], bitmap, num_pixels * 2);
 
-    // 4. Attendi che il DMA precedente sia libero
-	while(HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY) {}
+	// Switch buffer per prossimo MCU
+	buf_idx = 1 - buf_idx;
 
-	LCD_CS_1;
+	// Trasmetti dati pixel
+	spi_dma_ready = 0;
+	LCD_DC_1;      // Dati
+	LCD_CS_0;
+	HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)dma_buf[current_buf], num_pixels);
 
     return 1; // Continua decodifica
 }
@@ -216,10 +224,11 @@ int main(void)
 			  found = 1;
 		  }
 		  last_byte = byte;
+		  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
+		  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
 	  }
 
-	  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
-	  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
+
 
 	  // --- 2. Riavvolgimento puntatore ---
 	  // Riportiamo rd_ptr indietro di 2 byte per far vedere 0xFFD8 a jd_prepare
