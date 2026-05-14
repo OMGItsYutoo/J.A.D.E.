@@ -90,19 +90,6 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
     }
 }
 
-//uint32_t err=0;
-//
-//void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-//    if (huart->Instance == UART4) {
-//        err = HAL_UART_GetError(huart);
-//        // Se err != 0, qui puoi mettere un breakpoint per vedere che errore è
-//        // Esempio: 1 = Overrun, 2 = Noise, 4 = Framing
-//
-//        // Obbligatorio: riavvia la ricezione se si ferma!
-//        HAL_UART_Receive_DMA(&huart4, dma_rx_buf, UART_BUF_SIZE);
-//    }
-//}
-
 /* --- Funzione di Input per TJpgDec --- */
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
 	size_t read_bytes = 0;
@@ -131,16 +118,11 @@ int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
 
     // 3. Calcola numero di pixel (SPI a 16 bit invia Half-Words)
     uint32_t num_pixels = (rect->right - rect->left + 1) * (rect->bottom - rect->top + 1);
-    uint16_t* p = (uint16_t*)bitmap;
-    for(uint32_t i = 0; i < num_pixels; i++) {
-    	uint16_t t = p[i];
-    	p[i] = (t >> 8) | (t << 8);
-    }
 
     // 5. Trasmissione via DMA (passiamo num_pixels perché SPI è 16-bit)
     LCD_DC_1; // Dati
     LCD_CS_0;
-    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)bitmap, num_pixels*2);
+    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)bitmap, num_pixels);
 
     // 4. Attendi che il DMA precedente sia libero
 	while(HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY) {}
@@ -151,41 +133,8 @@ int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
 }
 
 int len;
-int before=0;
-int after=0;
 uint8_t found=0;
 JRESULT res;
-
-#define FILL_BUF_SIZE 512  // byte, deve essere pari
-static uint8_t fill_buf[FILL_BUF_SIZE];
-
-void LCD_FillDMA(uint16_t color, uint32_t num_pixels) {
-    // Riempi il buffer col colore (2 byte per pixel, big-endian)
-    uint8_t hi = color >> 8;
-    uint8_t lo = color & 0xFF;
-    for (int i = 0; i < FILL_BUF_SIZE; i += 2) {
-        fill_buf[i]   = hi;
-        fill_buf[i+1] = lo;
-    }
-
-    uint32_t bytes_remaining = num_pixels * 2;
-
-    LCD_DC_1;
-    LCD_CS_0;
-
-    while (bytes_remaining > 0) {
-        uint32_t chunk = (bytes_remaining > FILL_BUF_SIZE) ? FILL_BUF_SIZE : bytes_remaining;
-
-        spi_dma_ready = 0;
-        HAL_SPI_Transmit_DMA(&hspi1, fill_buf, chunk);
-        while (!spi_dma_ready);  // aspetta fine chunk
-
-        bytes_remaining -= chunk;
-    }
-
-    LCD_CS_1;
-}
-
 /* USER CODE END 0 */
 
 /**
@@ -267,10 +216,10 @@ int main(void)
 			  found = 1;
 		  }
 		  last_byte = byte;
-
-		  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
-		  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
 	  }
+
+	  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
+	  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
 
 	  // --- 2. Riavvolgimento puntatore ---
 	  // Riportiamo rd_ptr indietro di 2 byte per far vedere 0xFFD8 a jd_prepare
@@ -417,7 +366,7 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.DataSize = SPI_DATASIZE_16BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
