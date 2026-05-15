@@ -69,8 +69,8 @@ static void MX_SPI1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define UART_BUF_SIZE 65535  // Buffer circolare generoso per 2Mbit/s
-#define POOL_SIZE 4096
-#define DMA_BLOCK_SIZE 512
+#define POOL_SIZE 8192
+#define DMA_BLOCK_SIZE 1024
 
 uint16_t dma_buf[2][DMA_BLOCK_SIZE];
 volatile uint8_t buf_idx=0;
@@ -97,29 +97,28 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
 
 /* --- Funzione di Input per TJpgDec --- */
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
-	size_t read_bytes = 0;
+    size_t read_bytes = 0;
     while (read_bytes < nbyte) {
-        // Calcola la posizione attuale del cursore di scrittura DMA
         uint32_t wr_ptr = UART_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_uart4_rx);
 
-        if (rd_ptr != wr_ptr) {
-            if (buff) {
-                buff[read_bytes] = dma_rx_buf[rd_ptr];
-            }
-            rd_ptr = (rd_ptr + 1) % UART_BUF_SIZE;
-            read_bytes++;
-        } else {
-            // Se non ci sono dati, aspetta un istante per far respirare la CPU
-            //HAL_Delay(1);
-        }
+        uint32_t available = (wr_ptr - rd_ptr + UART_BUF_SIZE) % UART_BUF_SIZE;
+        if (available == 0) continue;
+
+        uint32_t to_read = nbyte - read_bytes;
+        uint32_t until_wrap = UART_BUF_SIZE - rd_ptr;
+        uint32_t chunk = to_read < available ? to_read : available;
+        if (chunk > until_wrap) chunk = until_wrap;
+
+        if (buff) memcpy(&buff[read_bytes], &dma_rx_buf[rd_ptr], chunk);
+        rd_ptr = (rd_ptr + chunk) % UART_BUF_SIZE;
+        read_bytes += chunk;
     }
     return read_bytes;
 }
-
 /* --- Funzione di Output per TJpgDec --- */
 int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
 	// 1. Imposta la finestra sul display
-    LCD_SetWindow(rect->left, rect->top, rect->right, rect->bottom);
+	LCD_SetWindow(rect->left, rect->top, rect->right, rect->bottom);
 
     // 3. Calcola numero di pixel (SPI a 16 bit invia Half-Words)
     uint32_t num_pixels = (rect->right - rect->left + 1) * (rect->bottom - rect->top + 1);
