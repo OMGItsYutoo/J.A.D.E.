@@ -68,16 +68,21 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define UART_BUF_SIZE 65535  // Buffer circolare generoso per 2Mbit/s
 #define POOL_SIZE 8192
 #define DMA_BLOCK_SIZE 1024
+
+#define BIG_BUF_SIZE 81200  // Dimensione del tuo buffer gigante (es. 100KB, occhio alla RAM!)
+#define DMA_BUF_SIZE 16318    // Buffer per il DMA
+
+uint8_t dma_rx_buf[DMA_BUF_SIZE];
+uint8_t big_rx_buf[BIG_BUF_SIZE];
 
 uint16_t dma_buf[2][DMA_BLOCK_SIZE];
 volatile uint8_t buf_idx=0;
 
-uint8_t dma_rx_buf[UART_BUF_SIZE];
 uint8_t jdec_pool[POOL_SIZE];     // Memoria di lavoro per il decoder
-uint32_t rd_ptr = 0;         // Puntatore di lettura per la infunc
+volatile uint32_t big_wr_ptr = 0;
+uint32_t big_rd_ptr = 0;     // Sostituisce il vecchio rd_ptr
 
 JDEC jdec;
 volatile uint8_t spi_dma_ready = 1;
@@ -87,6 +92,28 @@ uint8_t flash_mode = 0;
 
 char uart_msg[50];
 int buf_len;
+
+// Funzione helper per copiare nel buffer circolare gigante
+void Copy_To_Big_Buffer(uint8_t* src, uint16_t len) {
+    for(uint16_t i = 0; i < len; i++) {
+        big_rx_buf[big_wr_ptr] = src[i];
+        big_wr_ptr = (big_wr_ptr + 1) % BIG_BUF_SIZE;
+    }
+}
+
+// Chiamata quando la prima metà del buffer DMA è piena
+void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart) {
+    if(huart->Instance == UART4) {
+        Copy_To_Big_Buffer(&dma_rx_buf[0], DMA_BUF_SIZE / 2);
+    }
+}
+
+// Chiamata quando la seconda metà del buffer DMA è piena
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if(huart->Instance == UART4) {
+        Copy_To_Big_Buffer(&dma_rx_buf[DMA_BUF_SIZE / 2], DMA_BUF_SIZE / 2);
+    }
+}
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
     if (hspi == &hspi1) {
@@ -99,18 +126,19 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
     size_t read_bytes = 0;
     while (read_bytes < nbyte) {
-        uint32_t wr_ptr = UART_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_uart4_rx);
+        // Leggi il puntatore di scrittura aggiornato dagli interrupt
+        uint32_t wr_ptr = big_wr_ptr;
 
-        uint32_t available = (wr_ptr - rd_ptr + UART_BUF_SIZE) % UART_BUF_SIZE;
-        if (available == 0) continue;
+        uint32_t available = (wr_ptr - big_rd_ptr + BIG_BUF_SIZE) % BIG_BUF_SIZE;
+        if (available == 0) continue; // Aspetta nuovi dati
 
         uint32_t to_read = nbyte - read_bytes;
-        uint32_t until_wrap = UART_BUF_SIZE - rd_ptr;
+        uint32_t until_wrap = BIG_BUF_SIZE - big_rd_ptr;
         uint32_t chunk = to_read < available ? to_read : available;
         if (chunk > until_wrap) chunk = until_wrap;
 
-        if (buff) memcpy(&buff[read_bytes], &dma_rx_buf[rd_ptr], chunk);
-        rd_ptr = (rd_ptr + chunk) % UART_BUF_SIZE;
+        if (buff) memcpy(&buff[read_bytes], &big_rx_buf[big_rd_ptr], chunk);
+        big_rd_ptr = (big_rd_ptr + chunk) % BIG_BUF_SIZE;
         read_bytes += chunk;
     }
     return read_bytes;
@@ -179,7 +207,7 @@ int main(void)
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)joystickdata, 2);
-  HAL_UART_Receive_DMA(&huart4, dma_rx_buf, UART_BUF_SIZE);
+  HAL_UART_Receive_DMA(&huart4, dma_rx_buf, DMA_BUF_SIZE);
 
 
   HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_RESET);
@@ -231,9 +259,11 @@ int main(void)
 
 	  // --- 2. Riavvolgimento puntatore ---
 	  // Riportiamo rd_ptr indietro di 2 byte per far vedere 0xFFD8 a jd_prepare
-	  if (rd_ptr >= 2) rd_ptr -= 2;
-	  else rd_ptr = UART_BUF_SIZE - (2 - rd_ptr);
-
+	  if (big_rd_ptr >= 2) {
+		big_rd_ptr -= 2;
+	} else {
+		big_rd_ptr = BIG_BUF_SIZE - (2 - big_rd_ptr);
+	}
 	  // --- 3. Decompressione ---
 	  res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
 	  if (res == JDR_OK) {
