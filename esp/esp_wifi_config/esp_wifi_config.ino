@@ -16,8 +16,8 @@ WiFiUDP udp;
 const unsigned int localPort = 1104;
 
 // --- CONFIGURAZIONE RING BUFFER ---
-#define NUM_FRAMES 3
-#define MAX_JPEG_SIZE 25000 // 40KB per frame per non esaurire la RAM dell'ESP32
+#define NUM_FRAMES 2
+#define MAX_JPEG_SIZE 36000 // 40KB per frame per non esaurire la RAM dell'ESP32
 
 // Struttura che rappresenta un singolo "vassoio"
 typedef struct {
