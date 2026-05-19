@@ -2,12 +2,14 @@ import cv2
 from vilib import Vilib
 from time import sleep
 import socket
+import readchar
 
 ADDR='10.42.0.239'
 PORT=1104
 
 #Struttura concettuale del pacchetto UDP
 #[1 byte frame ID] [1 byte indice pacchetto] [1 byte totale pacchetto]
+
 
 def main():
     try:
@@ -33,10 +35,10 @@ def main():
         if frame is not None:
             
             small_frame = cv2.resize(frame, (480, 320))
-            
+           
             # 2. Comprimi il frame in formato JPEG al volo (in memoria)
             # cv2.imencode restituisce una tupla (successo_operazione, immagine_codificata)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 75]
             success, encoded_img = cv2.imencode('.jpg', small_frame, encode_param)
             
             if success:
@@ -66,16 +68,17 @@ def main():
 
                     socket_esp.sendto(packet, (ADDR, PORT))
                     #print(f"Inviato frame {i+1}")
-                 #   sleep(0.004) # Micro-pausa per far respirare il buffer di rete
+                    sleep(0.004) # Micro-pausa per far respirare il buffer di rete
  
                 current_frame_id += 1
                 # 5. Marker di fine pacchetto per avvisare l'ESP
                 socket_esp.sendto(b'EOF', (ADDR, PORT))
-                #return
+                print("Press to send next...")
+                readchar.readkey()
             
         # 6. Pausa per limitare i Frame Per Second (FPS) 
         # Evita di saturare il processore del Pi e la banda Wi-Fi
-        sleep(0.25) # ~20 FPS teorici massimi
+        sleep(0.05) # ~20 FPS teorici massimi
 
 
 if __name__=='__main__':

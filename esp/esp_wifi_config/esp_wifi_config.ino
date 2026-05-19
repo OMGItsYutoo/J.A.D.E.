@@ -109,7 +109,7 @@ void handleUDP() {
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(2000000, SERIAL_8N1, RXD1, TXD1);
+  Serial1.begin(2000000, SERIAL_8E1, RXD1, TXD1);
 
   // Connessione WiFi
   WiFi.begin(ssid, password);
