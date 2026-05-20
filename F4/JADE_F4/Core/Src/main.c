@@ -73,6 +73,8 @@ static void MX_SPI1_Init(void);
 
 #define BIG_BUF_SIZE 81200  // Dimensione del tuo buffer gigante (es. 100KB, occhio alla RAM!)
 #define DMA_BUF_SIZE 16318    // Buffer per il DMA
+#define WAVE_MESSAGE "wave\n"
+#define GOOD_OL_TIMES "train\n"
 
 uint8_t dma_rx_buf[DMA_BUF_SIZE];
 uint8_t big_rx_buf[BIG_BUF_SIZE];
@@ -92,6 +94,38 @@ uint8_t flash_mode = 0;
 
 char uart_msg[50];
 int buf_len;
+
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	if (GPIO_Pin == GPIO_PIN_0) {
+		static uint8_t press_count = 0;
+	    static uint32_t last_press_tick = 0;
+
+	    uint32_t now = HAL_GetTick();
+
+	    // Debounce: ignora pressioni più veloci di 120ms
+	    //se quando premo ne conta di più vuol dire che non sta filtrando abbastanza quindi alzare tempo
+	    if (now - last_press_tick < 120) {
+	        return;
+	    }
+
+	    // Se è passato più di 1 secondo dall'ultima pressione, resetta
+	    if (now - last_press_tick > 700) {
+	        press_count = 0;
+	    }
+
+	    last_press_tick = now;
+	    press_count++;
+
+	    if (press_count >= 8) {
+	        HAL_UART_Transmit(&huart4, (uint8_t*)GOOD_OL_TIMES, sizeof(GOOD_OL_TIMES), 10);
+	        press_count = 0;
+	    } else {
+	        HAL_UART_Transmit(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE), 10);
+	    }
+	}
+}
+
 
 // Funzione helper per copiare nel buffer circolare gigante
 void Copy_To_Big_Buffer(uint8_t* src, uint16_t len) {
@@ -440,9 +474,9 @@ static void MX_UART4_Init(void)
   /* USER CODE END UART4_Init 1 */
   huart4.Instance = UART4;
   huart4.Init.BaudRate = 2000000;
-  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.WordLength = UART_WORDLENGTH_9B;
   huart4.Init.StopBits = UART_STOPBITS_1;
-  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Parity = UART_PARITY_EVEN;
   huart4.Init.Mode = UART_MODE_TX_RX;
   huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart4.Init.OverSampling = UART_OVERSAMPLING_16;
@@ -494,6 +528,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, LCD_DC_Pin|LCD_CS_Pin, GPIO_PIN_RESET);
@@ -514,6 +549,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LCD_RST_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
