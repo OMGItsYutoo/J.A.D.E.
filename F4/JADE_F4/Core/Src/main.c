@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "tjpgd.h"
+#include <math.h>
 #include "ILI9486.h"
 /* USER CODE END Includes */
 
@@ -68,13 +69,23 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define POOL_SIZE 8192
-#define DMA_BLOCK_SIZE 1024
+#define POOL_SIZE 4096
+#define DMA_BLOCK_SIZE 512
 
 #define BIG_BUF_SIZE 81200  // Dimensione del tuo buffer gigante (es. 100KB, occhio alla RAM!)
 #define DMA_BUF_SIZE 16318    // Buffer per il DMA
 #define WAVE_MESSAGE "wave\n"
 #define GOOD_OL_TIMES "train\n"
+
+static uint8_t lut_r[32];
+static uint8_t lut_g[64];
+
+void init_lut(void) {
+    for(int i = 0; i < 32; i++)
+        lut_r[i] = (uint8_t)(powf((float)i / 31.0f, 0.5f) * 31.0f);
+    for(int i = 0; i < 64; i++)
+        lut_g[i] = (uint8_t)(powf((float)i / 63.0f, 0.5f) * 63.0f);
+}
 
 uint8_t dma_rx_buf[DMA_BUF_SIZE];
 uint8_t big_rx_buf[BIG_BUF_SIZE];
@@ -179,15 +190,26 @@ size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
 }
 /* --- Funzione di Output per TJpgDec --- */
 int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
+	while (spi_dma_ready == 0) __NOP();
+
 	// 1. Imposta la finestra sul display
 	LCD_SetWindow(rect->left, rect->top, rect->right, rect->bottom);
 
     // 3. Calcola numero di pixel (SPI a 16 bit invia Half-Words)
     uint32_t num_pixels = (rect->right - rect->left + 1) * (rect->bottom - rect->top + 1);
 
+    uint16_t *pixels = (uint16_t*)bitmap;
+    for(uint32_t i = 0; i < num_pixels; i++) {
+        uint16_t p = pixels[i];
+        uint8_t r = (p >> 11) & 0x1F;
+        uint8_t g = (p >> 5)  & 0x3F;
+        uint8_t b = p & 0x1F;
+
+        pixels[i] = (lut_r[r] << 11) | (lut_g[g] << 5) | b;
+    }
 	// Salva indice buffer PRIMA di switchare
 	uint8_t current_buf = buf_idx;
-	memcpy(dma_buf[current_buf], bitmap, num_pixels * 2);
+	memcpy(dma_buf[current_buf], bitmap, num_pixels*2);
 
 	// Switch buffer per prossimo MCU
 	buf_idx = 1 - buf_idx;
@@ -237,6 +259,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
+  init_lut();
   MX_UART4_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
@@ -504,12 +527,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
-  /* DMA2_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
   /* DMA2_Stream4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
+  /* DMA2_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream5_IRQn);
 
 }
 
