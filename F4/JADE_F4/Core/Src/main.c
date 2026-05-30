@@ -70,10 +70,8 @@ static void MX_SPI1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define POOL_SIZE 4096
-#define DMA_BLOCK_SIZE 512
+#define DMA_BLOCK_SIZE 1024
 
-#define BIG_BUF_SIZE 81200  // Dimensione del tuo buffer gigante (es. 100KB, occhio alla RAM!)
-#define DMA_BUF_SIZE 16318    // Buffer per il DMA
 #define WAVE_MESSAGE "wave\n"
 #define GOOD_OL_TIMES "train\n"
 
@@ -82,13 +80,19 @@ static uint8_t lut_g[64];
 
 void init_lut(void) {
     for(int i = 0; i < 32; i++)
-        lut_r[i] = (uint8_t)(powf((float)i / 31.0f, 0.5f) * 31.0f);
+        lut_r[i] = (uint8_t)(powf((float)i / 31.0f, 0.6f) * 31.0f);
     for(int i = 0; i < 64; i++)
-        lut_g[i] = (uint8_t)(powf((float)i / 63.0f, 0.5f) * 63.0f);
+        lut_g[i] = (uint8_t)(powf((float)i / 63.0f, 0.7f) * 63.0f);
 }
 
-uint8_t dma_rx_buf[DMA_BUF_SIZE];
-uint8_t big_rx_buf[BIG_BUF_SIZE];
+#define MAX_JPEG_SIZE 30000 // 60 KB max per frame
+uint8_t jpeg_buf[4][MAX_JPEG_SIZE];
+
+volatile uint8_t  dma_write_idx = 0;   // Indice dove scrive il DMA (0 o 1)
+volatile uint8_t  cpu_read_idx = 0;    // Indice da dove legge la CPU (0 o 1)
+volatile uint8_t  frame_ready = 0;     // Flag: 1 = abbiamo un'immagine pronta
+volatile uint32_t current_frame_len = 0; // Quanto è grossa l'immagine appena arrivata
+uint32_t jpeg_read_offset = 0; // Usato da in_func per scorrere l'array
 
 uint16_t dma_buf[2][DMA_BLOCK_SIZE];
 volatile uint8_t buf_idx=0;
@@ -106,6 +110,17 @@ uint8_t flash_mode = 0;
 char uart_msg[50];
 int buf_len;
 
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+	if (huart->Instance == UART4) {
+		current_frame_len = Size;
+		cpu_read_idx = dma_write_idx;
+		frame_ready = 1;
+		dma_write_idx = (dma_write_idx + 1) % 4;
+
+		HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+
+	}
+}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == GPIO_PIN_0) {
@@ -137,29 +152,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	}
 }
 
-
-// Funzione helper per copiare nel buffer circolare gigante
-void Copy_To_Big_Buffer(uint8_t* src, uint16_t len) {
-    for(uint16_t i = 0; i < len; i++) {
-        big_rx_buf[big_wr_ptr] = src[i];
-        big_wr_ptr = (big_wr_ptr + 1) % BIG_BUF_SIZE;
-    }
-}
-
-// Chiamata quando la prima metà del buffer DMA è piena
-void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart) {
-    if(huart->Instance == UART4) {
-        Copy_To_Big_Buffer(&dma_rx_buf[0], DMA_BUF_SIZE / 2);
-    }
-}
-
-// Chiamata quando la seconda metà del buffer DMA è piena
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if(huart->Instance == UART4) {
-        Copy_To_Big_Buffer(&dma_rx_buf[DMA_BUF_SIZE / 2], DMA_BUF_SIZE / 2);
-    }
-}
-
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
     if (hspi == &hspi1) {
         LCD_CS_1;
@@ -167,27 +159,26 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
     }
 }
 
-/* --- Funzione di Input per TJpgDec --- */
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
-    size_t read_bytes = 0;
-    while (read_bytes < nbyte) {
-        // Leggi il puntatore di scrittura aggiornato dagli interrupt
-        uint32_t wr_ptr = big_wr_ptr;
+    // Se abbiamo superato la lunghezza del frame, fermiamo tutto
+    if (jpeg_read_offset >= current_frame_len) return 0;
 
-        uint32_t available = (wr_ptr - big_rd_ptr + BIG_BUF_SIZE) % BIG_BUF_SIZE;
-        if (available == 0) continue; // Aspetta nuovi dati
-
-        uint32_t to_read = nbyte - read_bytes;
-        uint32_t until_wrap = BIG_BUF_SIZE - big_rd_ptr;
-        uint32_t chunk = to_read < available ? to_read : available;
-        if (chunk > until_wrap) chunk = until_wrap;
-
-        if (buff) memcpy(&buff[read_bytes], &big_rx_buf[big_rd_ptr], chunk);
-        big_rd_ptr = (big_rd_ptr + chunk) % BIG_BUF_SIZE;
-        read_bytes += chunk;
+    // Calcoliamo quanti byte possiamo leggere al massimo
+    size_t to_read = nbyte;
+    if (jpeg_read_offset + to_read > current_frame_len) {
+        to_read = current_frame_len - jpeg_read_offset;
     }
-    return read_bytes;
+
+    // Se buff non è NULL, copiamo i dati
+    if (buff) {
+        memcpy(buff, &jpeg_buf[cpu_read_idx][jpeg_read_offset], to_read);
+    }
+
+    jpeg_read_offset += to_read; // Avanziamo l'offset per la prossima chiamata
+
+    return to_read;
 }
+
 /* --- Funzione di Output per TJpgDec --- */
 int out_func(JDEC* jd, void* bitmap, JRECT* rect) {
 	while (spi_dma_ready == 0) __NOP();
@@ -264,8 +255,7 @@ int main(void)
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)joystickdata, 2);
-  HAL_UART_Receive_DMA(&huart4, dma_rx_buf, DMA_BUF_SIZE);
-
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
 
   HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_RESET);
   HAL_Delay(100);
@@ -292,48 +282,45 @@ int main(void)
 
   }*/
 
+  // Variabili globali condivise (assicurati che siano dichiarate volatile!)
+  // volatile int8_t latest_ready_idx = -1;
+  // volatile int8_t cpu_in_use_idx = -1;
+  // volatile uint16_t frame_lens[3];
+
   while (1)
-  {
-    /* USER CODE END WHILE */
+    {
+      /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
-	  uint8_t byte;
-	  uint8_t last_byte = 0;
-	  found = 0;
+		/* USER CODE BEGIN 3 */
+	  if (frame_ready) {
+			// Resettiamo l'offset della in_func per il nuovo frame
+			jpeg_read_offset = 0;
 
-	  // --- 1. Sincronizzazione al marker JPEG (0xFFD8) ---
-	  while (!found) {
-		  in_func(NULL, &byte, 1);
-		  if (last_byte == 0xFF && byte == 0xD8) {
-			  found = 1;
-		  }
-		  last_byte = byte;
-		  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
-		  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
+			while (jpeg_read_offset < current_frame_len - 1) {
+				if (jpeg_buf[cpu_read_idx][jpeg_read_offset] == 0xFF &&
+					jpeg_buf[cpu_read_idx][jpeg_read_offset + 1] == 0xD8) {
+					break; // Trovato!
+				}
+				jpeg_read_offset++;
+			}
+
+			if (jpeg_read_offset < current_frame_len - 1) {
+				res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
+				if (res == JDR_OK) {
+					jd_decomp(&jdec, out_func, 0);
+				}
+			}
+
+			while (!spi_dma_ready);
+			LCD_CS_1;
+
+			frame_ready = 0;
+
 	  }
-
-
-
-	  // --- 2. Riavvolgimento puntatore ---
-	  // Riportiamo rd_ptr indietro di 2 byte per far vedere 0xFFD8 a jd_prepare
-	  if (big_rd_ptr >= 2) {
-		big_rd_ptr -= 2;
-	} else {
-		big_rd_ptr = BIG_BUF_SIZE - (2 - big_rd_ptr);
-	}
-	  // --- 3. Decompressione ---
-	  res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
-	  if (res == JDR_OK) {
-		  // Parametri: oggetto, output_func, scale (0=1/1, 1=1/2, 2=1/4)
-		  jd_decomp(&jdec, out_func, 0);
-	  }
-
-	  // Finito il frame, pulisce i flag e ricomincia a cercare il prossimo header
-	  while (!spi_dma_ready);
-	  LCD_CS_1;
-  }
+    }
   /* USER CODE END 3 */
 }
+
 
 /**
   * @brief System Clock Configuration
