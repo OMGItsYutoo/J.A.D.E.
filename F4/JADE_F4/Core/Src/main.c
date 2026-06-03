@@ -88,6 +88,9 @@ void init_lut(void) {
 #define MAX_JPEG_SIZE 30000 // 60 KB max per frame
 uint8_t jpeg_buf[4][MAX_JPEG_SIZE];
 
+volatile uint8_t buffer_locked[4] = {0}; // 0 = Libero, 1 = Bloccato dal decompressore
+volatile uint8_t locked_cpu_idx = 0;     // Indice locale per evitare che l'ISR lo modifichi sotto il naso del main
+
 volatile uint8_t  dma_write_idx = 0;   // Indice dove scrive il DMA (0 o 1)
 volatile uint8_t  cpu_read_idx = 0;    // Indice da dove legge la CPU (0 o 1)
 volatile uint8_t  frame_ready = 0;     // Flag: 1 = abbiamo un'immagine pronta
@@ -111,20 +114,33 @@ char uart_msg[50];
 int buf_len;
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
-	if (huart->Instance == UART4) {
-		current_frame_len = Size;
-		cpu_read_idx = dma_write_idx;
-		frame_ready = 1;
-		dma_write_idx = (dma_write_idx + 1) % 4;
+    if (huart->Instance == UART4) {
+        current_frame_len = Size;
+        cpu_read_idx = dma_write_idx;
+        frame_ready = 1;
 
-		HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+        // Calcola il prossimo indice dove il DMA vorrebbe scrivere
+        uint8_t next_idx = (dma_write_idx + 1) % 4;
 
-	}
+        // MUTUA ESCLUSIONE: Controlla se il buffer successivo è bloccato
+        if (buffer_locked[next_idx] == 0) {
+            // È libero, possiamo avanzare
+            dma_write_idx = next_idx;
+        } else {
+            // OVERRUN: Il decompressore non ha ancora finito!
+            // Non avanziamo dma_write_idx. Il prossimo frame sovrascriverà
+            // quello appena arrivato nello stesso slot, proteggendo il buffer bloccato.
+        }
+
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+    }
 }
+
+uint8_t press_count = 0;
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == GPIO_PIN_0) {
-		static uint8_t press_count = 0;
+
 	    static uint32_t last_press_tick = 0;
 
 	    uint32_t now = HAL_GetTick();
@@ -160,22 +176,19 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
 }
 
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
-    // Se abbiamo superato la lunghezza del frame, fermiamo tutto
     if (jpeg_read_offset >= current_frame_len) return 0;
 
-    // Calcoliamo quanti byte possiamo leggere al massimo
     size_t to_read = nbyte;
     if (jpeg_read_offset + to_read > current_frame_len) {
         to_read = current_frame_len - jpeg_read_offset;
     }
 
-    // Se buff non è NULL, copiamo i dati
     if (buff) {
-        memcpy(buff, &jpeg_buf[cpu_read_idx][jpeg_read_offset], to_read);
+        // Usa locked_cpu_idx, NON cpu_read_idx!
+        memcpy(buff, &jpeg_buf[locked_cpu_idx][jpeg_read_offset], to_read);
     }
 
-    jpeg_read_offset += to_read; // Avanziamo l'offset per la prossima chiamata
-
+    jpeg_read_offset += to_read;
     return to_read;
 }
 
@@ -292,30 +305,38 @@ int main(void)
       /* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
+	  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
+	  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
+
 	  if (frame_ready) {
-			// Resettiamo l'offset della in_func per il nuovo frame
-			jpeg_read_offset = 0;
+		  // 1. ACQUISISCI IL LOCK sul buffer che stiamo per leggere
+		  locked_cpu_idx = cpu_read_idx;
+		  buffer_locked[locked_cpu_idx] = 1; // Blocchiamo l'accesso all'ISR
+		  frame_ready = 0; // Resettiamo subito il flag
 
-			while (jpeg_read_offset < current_frame_len - 1) {
-				if (jpeg_buf[cpu_read_idx][jpeg_read_offset] == 0xFF &&
-					jpeg_buf[cpu_read_idx][jpeg_read_offset + 1] == 0xD8) {
-					break; // Trovato!
-				}
-				jpeg_read_offset++;
-			}
+		  jpeg_read_offset = 0;
 
-			if (jpeg_read_offset < current_frame_len - 1) {
-				res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
-				if (res == JDR_OK) {
-					jd_decomp(&jdec, out_func, 0);
-				}
-			}
+		  // Ricerca header
+		  while (jpeg_read_offset < current_frame_len - 1) {
+			  if (jpeg_buf[locked_cpu_idx][jpeg_read_offset] == 0xFF &&
+				  jpeg_buf[locked_cpu_idx][jpeg_read_offset + 1] == 0xD8) {
+				  break;
+			  }
+			  jpeg_read_offset++;
+		  }
 
-			while (!spi_dma_ready);
-			LCD_CS_1;
+		  if (jpeg_read_offset < current_frame_len - 1) {
+			  res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
+			  if (res == JDR_OK) {
+				  jd_decomp(&jdec, out_func, 0);
+			  }
+		  }
 
-			frame_ready = 0;
+		  while (!spi_dma_ready);
+		  LCD_CS_1;
 
+		  // 2. RILASCIA IL LOCK una volta terminata la decompressione
+		  buffer_locked[locked_cpu_idx] = 0;
 	  }
     }
   /* USER CODE END 3 */
