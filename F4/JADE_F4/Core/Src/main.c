@@ -276,6 +276,9 @@ int main(void)
   HAL_Delay(200);
 
   LCD_Init(U2D_L2R, 255);
+
+  uint32_t last_joystick_tx_tick = 0;
+  const uint32_t JOYSTICK_TX_INTERVAL = 50; // Intervallo in millisecondi (es. 100ms = 10 volte al secondo)
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -305,8 +308,17 @@ int main(void)
       /* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
-	  len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
-	  HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
+	  uint32_t current_tick = HAL_GetTick();
+
+		// 2. Controlla se è passato abbastanza tempo dall'ultimo invio
+		if (current_tick - last_joystick_tx_tick >= JOYSTICK_TX_INTERVAL) {
+
+			len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
+			HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
+
+			// 3. Aggiorna il tempo dell'ultimo invio
+			last_joystick_tx_tick = current_tick;
+		}
 
 	  if (frame_ready) {
 		  // 1. ACQUISISCI IL LOCK sul buffer che stiamo per leggere
