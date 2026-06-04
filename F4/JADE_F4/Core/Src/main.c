@@ -49,6 +49,8 @@ DMA_HandleTypeDef hdma_adc1;
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
 
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart4;
 DMA_HandleTypeDef hdma_uart4_rx;
 
@@ -63,6 +65,7 @@ static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_UART4_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -75,6 +78,8 @@ static void MX_SPI1_Init(void);
 #define WAVE_MESSAGE "wave\n"
 #define GOOD_OL_TIMES "train\n"
 
+#define NUM_BUFFERS 4
+
 static uint8_t lut_r[32];
 static uint8_t lut_g[64];
 
@@ -85,64 +90,93 @@ void init_lut(void) {
         lut_g[i] = (uint8_t)(powf((float)i / 63.0f, 0.7f) * 63.0f);
 }
 
-#define MAX_JPEG_SIZE 30000 // 60 KB max per frame
-uint8_t jpeg_buf[4][MAX_JPEG_SIZE];
+#define MAX_JPEG_SIZE 20000 // 60 KB max per frame
+uint8_t jpeg_buf[NUM_BUFFERS][MAX_JPEG_SIZE];
 
-volatile uint8_t buffer_locked[4] = {0}; // 0 = Libero, 1 = Bloccato dal decompressore
-volatile uint8_t locked_cpu_idx = 0;     // Indice locale per evitare che l'ISR lo modifichi sotto il naso del main
+#define BUF_FREE   0
+#define BUF_DMA    1
+#define BUF_READY  2
 
-volatile uint8_t  dma_write_idx = 0;   // Indice dove scrive il DMA (0 o 1)
-volatile uint8_t  cpu_read_idx = 0;    // Indice da dove legge la CPU (0 o 1)
-volatile uint8_t  frame_ready = 0;     // Flag: 1 = abbiamo un'immagine pronta
-volatile uint32_t current_frame_len = 0; // Quanto è grossa l'immagine appena arrivata
-uint32_t jpeg_read_offset = 0; // Usato da in_func per scorrere l'array
+// Tutti i buffer nascono liberi, tranne il primo che diamo subito al DMA
+volatile uint8_t buffer_state[NUM_BUFFERS] = {BUF_DMA, BUF_FREE,BUF_FREE,BUF_FREE};
+volatile uint32_t frame_lengths[NUM_BUFFERS] = {0};
+
+volatile uint8_t dma_write_idx = 0;      // Dove scrive il DMA
+uint8_t locked_cpu_idx = 0;              // Buffer attualmente posseduto dalla CPU
+uint32_t locked_frame_len = 0;           // Lunghezza protetta per la CPU
+uint32_t jpeg_read_offset = 0;           // Usato da in_func per scorrere l'array
 
 uint16_t dma_buf[2][DMA_BLOCK_SIZE];
 volatile uint8_t buf_idx=0;
 
-uint8_t jdec_pool[POOL_SIZE];     // Memoria di lavoro per il decoder
-volatile uint32_t big_wr_ptr = 0;
-uint32_t big_rd_ptr = 0;     // Sostituisce il vecchio rd_ptr
-
+__attribute__((aligned(4))) uint8_t jdec_pool[POOL_SIZE]; // Memoria allineata!
 JDEC jdec;
 volatile uint8_t spi_dma_ready = 1;
 
 uint16_t joystickdata[2];
-uint8_t flash_mode = 0;
+char timer_uart_msg[25];
+volatile uint8_t joystick_tx_busy = 0;
 
-char uart_msg[50];
-int buf_len;
+uint8_t cpu_jpeg_buf[MAX_JPEG_SIZE];
+uint32_t cpu_frame_len;
 
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
-    if (huart->Instance == UART4) {
-        current_frame_len = Size;
-        cpu_read_idx = dma_write_idx;
-        frame_ready = 1;
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM3) {
+        if (joystick_tx_busy == 0) {
+            joystick_tx_busy = 1;
 
-        // Calcola il prossimo indice dove il DMA vorrebbe scrivere
-        uint8_t next_idx = (dma_write_idx + 1) % 4;
-
-        // MUTUA ESCLUSIONE: Controlla se il buffer successivo è bloccato
-        if (buffer_locked[next_idx] == 0) {
-            // È libero, possiamo avanzare
-            dma_write_idx = next_idx;
-        } else {
-            // OVERRUN: Il decompressore non ha ancora finito!
-            // Non avanziamo dma_write_idx. Il prossimo frame sovrascriverà
-            // quello appena arrivato nello stesso slot, proteggendo il buffer bloccato.
+            int len = sprintf(timer_uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
+            HAL_UART_Transmit_IT(&huart4, (uint8_t*)timer_uart_msg, len);
         }
-
-        HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
     }
 }
 
-uint8_t press_count = 0;
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == UART4) {
+        joystick_tx_busy = 0;
+    }
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+    if (huart->Instance == UART4) {
+
+        uint8_t next_idx = (dma_write_idx + 1) % NUM_BUFFERS;
+
+        if (buffer_state[next_idx] == BUF_FREE) {
+            /* Commit del frame corrente, avanza al prossimo slot */
+            frame_lengths[dma_write_idx] = Size;
+            buffer_state[dma_write_idx] = BUF_READY;
+
+            dma_write_idx = next_idx;
+            buffer_state[dma_write_idx] = BUF_DMA;
+        }
+        /* else: overflow → il DMA ricomincia sullo stesso buffer,
+           scartando il frame parziale appena ricevuto. Perdita accettabile
+           per uno stream live. */
+
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+        __HAL_DMA_DISABLE_IT(&hdma_uart4_rx, DMA_IT_HT);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == UART4) {
+        // Pulisci i flag di errore hardware
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        __HAL_UART_CLEAR_NEFLAG(huart);
+        __HAL_UART_CLEAR_FEFLAG(huart);
+
+        // Riavvia il DMA
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+        __HAL_DMA_DISABLE_IT(&hdma_uart4_rx, DMA_IT_HT); // Disabilita sempre l'HT!
+    }
+}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == GPIO_PIN_0) {
 
 	    static uint32_t last_press_tick = 0;
-
+	    static uint8_t press_count = 0;
 	    uint32_t now = HAL_GetTick();
 
 	    // Debounce: ignora pressioni più veloci di 120ms
@@ -160,32 +194,34 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	    press_count++;
 
 	    if (press_count >= 8) {
-	        HAL_UART_Transmit(&huart4, (uint8_t*)GOOD_OL_TIMES, sizeof(GOOD_OL_TIMES), 10);
+	        HAL_UART_Transmit_IT(&huart4, (uint8_t*)GOOD_OL_TIMES, sizeof(GOOD_OL_TIMES));
 	        press_count = 0;
 	    } else {
-	        HAL_UART_Transmit(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE), 10);
+	        HAL_UART_Transmit_IT(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE));
 	    }
 	}
 }
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
-    if (hspi == &hspi1) {
-        LCD_CS_1;
-        spi_dma_ready = 1;
-    }
+	while (__HAL_SPI_GET_FLAG(hspi, SPI_FLAG_BSY) != RESET) {
+			__NOP();
+	}
+	LCD_CS_1; // Ora è sicuro alzare il Chip Select
+	spi_dma_ready = 1;
 }
 
+
 size_t in_func(JDEC* jd, uint8_t* buff, size_t nbyte) {
-    if (jpeg_read_offset >= current_frame_len) return 0;
+    // Usiamo cpu_frame_len invece del vecchio locked_frame_len!
+    if (jpeg_read_offset >= cpu_frame_len) return 0;
 
     size_t to_read = nbyte;
-    if (jpeg_read_offset + to_read > current_frame_len) {
-        to_read = current_frame_len - jpeg_read_offset;
+    if (jpeg_read_offset + to_read > cpu_frame_len) {
+        to_read = cpu_frame_len - jpeg_read_offset;
     }
 
     if (buff) {
-        // Usa locked_cpu_idx, NON cpu_read_idx!
-        memcpy(buff, &jpeg_buf[locked_cpu_idx][jpeg_read_offset], to_read);
+        memcpy(buff, &cpu_jpeg_buf[jpeg_read_offset], to_read);
     }
 
     jpeg_read_offset += to_read;
@@ -263,12 +299,13 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  init_lut();
   MX_UART4_Init();
   MX_SPI1_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)joystickdata, 2);
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+
+  HAL_TIM_Base_Start_IT(&htim3);
 
   HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_RESET);
   HAL_Delay(100);
@@ -276,84 +313,61 @@ int main(void)
   HAL_Delay(200);
 
   LCD_Init(U2D_L2R, 255);
+  init_lut();
 
-  uint32_t last_joystick_tx_tick = 0;
-  const uint32_t JOYSTICK_TX_INTERVAL = 50; // Intervallo in millisecondi (es. 100ms = 10 volte al secondo)
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart4, jpeg_buf[dma_write_idx], MAX_JPEG_SIZE);
+    __HAL_DMA_DISABLE_IT(&hdma_uart4_rx, DMA_IT_HT);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  /*while (1) {
-	  LCD_SetWindow(0, 0, 479, 319);
-	  LCD_FillDMA(RED, 480 * 320);
-
-	  HAL_Delay(1000);
-
-	  LCD_SetWindow(0, 0, 479, 319);
-	  	  LCD_FillDMA(BLUE, 480 * 320);
-
-	  	  HAL_Delay(1000);
-
-
-  }*/
-
-  // Variabili globali condivise (assicurati che siano dichiarate volatile!)
-  // volatile int8_t latest_ready_idx = -1;
-  // volatile int8_t cpu_in_use_idx = -1;
-  // volatile uint16_t frame_lens[3];
-
+  uint8_t main_read_idx = 0; // Il main parte dallo slot 0
   while (1)
     {
-      /* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
-		/* USER CODE BEGIN 3 */
-	  uint32_t current_tick = HAL_GetTick();
+    /* USER CODE BEGIN 3 */
+	  if (buffer_state[main_read_idx] == BUF_READY) {
 
-		// 2. Controlla se è passato abbastanza tempo dall'ultimo invio
-		if (current_tick - last_joystick_tx_tick >= JOYSTICK_TX_INTERVAL) {
+			  // IL BUFFER È DELLA CPU! Nessun rischio di sovrascrittura.
+		  	  cpu_frame_len = frame_lengths[main_read_idx];
 
-			len = sprintf(uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
-			HAL_UART_Transmit(&huart4, (uint8_t*)uart_msg, len, 10);
+		      memcpy(cpu_jpeg_buf,
+		             jpeg_buf[main_read_idx],
+		             cpu_frame_len);
 
-			// 3. Aggiorna il tempo dell'ultimo invio
-			last_joystick_tx_tick = current_tick;
+		      // Libero IMMEDIATAMENTE
+		      buffer_state[main_read_idx] = BUF_FREE;
+
+			main_read_idx = (main_read_idx + 1) % NUM_BUFFERS;
+
+			jpeg_read_offset = 0;
+
+			// Ricerca header
+			while (jpeg_read_offset < cpu_frame_len - 1) {
+				if (cpu_jpeg_buf[jpeg_read_offset] == 0xFF &&
+						cpu_jpeg_buf[jpeg_read_offset + 1] == 0xD8) {
+					break;
+				}
+				jpeg_read_offset++;
+			}
+
+			if (jpeg_read_offset < cpu_frame_len - 1) {
+				res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
+				if (res == JDR_OK) {
+					jd_decomp(&jdec, out_func, 0);
+				}
+			}
+
+			// HO FINITO CON IL JPEG! Libero lo slot per il DMA della UART
+			// Passo ad aspettare il buffer successivo
+
 		}
-
-	  if (frame_ready) {
-		  // 1. ACQUISISCI IL LOCK sul buffer che stiamo per leggere
-		  locked_cpu_idx = cpu_read_idx;
-		  buffer_locked[locked_cpu_idx] = 1; // Blocchiamo l'accesso all'ISR
-		  frame_ready = 0; // Resettiamo subito il flag
-
-		  jpeg_read_offset = 0;
-
-		  // Ricerca header
-		  while (jpeg_read_offset < current_frame_len - 1) {
-			  if (jpeg_buf[locked_cpu_idx][jpeg_read_offset] == 0xFF &&
-				  jpeg_buf[locked_cpu_idx][jpeg_read_offset + 1] == 0xD8) {
-				  break;
-			  }
-			  jpeg_read_offset++;
-		  }
-
-		  if (jpeg_read_offset < current_frame_len - 1) {
-			  res = jd_prepare(&jdec, in_func, jdec_pool, POOL_SIZE, NULL);
-			  if (res == JDR_OK) {
-				  jd_decomp(&jdec, out_func, 0);
-			  }
-		  }
-
-		  while (!spi_dma_ready);
-		  LCD_CS_1;
-
-		  // 2. RILASCIA IL LOCK una volta terminata la decompressione
-		  buffer_locked[locked_cpu_idx] = 0;
-	  }
     }
   /* USER CODE END 3 */
 }
-
 
 /**
   * @brief System Clock Configuration
@@ -501,6 +515,51 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 8399;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 499;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
   * @brief UART4 Initialization Function
   * @param None
   * @retval None
@@ -600,7 +659,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 5);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
