@@ -49,6 +49,7 @@ DMA_HandleTypeDef hdma_adc1;
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
 
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart4;
@@ -66,6 +67,7 @@ static void MX_ADC1_Init(void);
 static void MX_UART4_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -120,14 +122,35 @@ volatile uint8_t joystick_tx_busy = 0;
 uint8_t cpu_jpeg_buf[MAX_JPEG_SIZE];
 uint32_t cpu_frame_len;
 
+volatile uint32_t btn_last_press_tick = 0;
+volatile uint8_t btn_press_count = 0;
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM3) {
         if (joystick_tx_busy == 0) {
             joystick_tx_busy = 1;
-
             int len = sprintf(timer_uart_msg, "%u,%u\n", joystickdata[0], joystickdata[1]);
             HAL_UART_Transmit_IT(&huart4, (uint8_t*)timer_uart_msg, len);
         }
+    }
+
+    // --- NUOVA LOGICA TIM2 PER FINESTRA CLICK ---
+    if (htim->Instance == TIM2) {
+        // Il tempo è scaduto! Spegniamo il timer in modalità One-Shot
+        HAL_TIM_Base_Stop_IT(&htim2);
+
+        if (btn_press_count == 1) {
+            // Click singolo confermato!
+            HAL_UART_Transmit_IT(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE));
+        }
+        else if (btn_press_count > 1) {
+            // Ha premuto 2 o 3 volte ma si è fermato prima di 4.
+            // Decidi tu se mandare comunque "wave" o fare altro.
+            HAL_UART_Transmit_IT(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE));
+        }
+
+        // Reset del contatore per la prossima sequenza
+        btn_press_count = 0;
     }
 }
 
@@ -173,33 +196,33 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	if (GPIO_Pin == GPIO_PIN_0) {
+    if (GPIO_Pin == GPIO_PIN_0) {
+        uint32_t now = HAL_GetTick();
 
-	    static uint32_t last_press_tick = 0;
-	    static uint8_t press_count = 0;
-	    uint32_t now = HAL_GetTick();
+        // 1. Debounce software: ignora rimbalzi sotto i 150ms
+        if (now - btn_last_press_tick < 150) {
+            return;
+        }
+        btn_last_press_tick = now;
 
-	    // Debounce: ignora pressioni più veloci di 120ms
-	    //se quando premo ne conta di più vuol dire che non sta filtrando abbastanza quindi alzare tempo
-	    if (now - last_press_tick < 120) {
-	        return;
-	    }
+        // 2. Incrementa il numero di click
+        btn_press_count++;
 
-	    // Se è passato più di 1 secondo dall'ultima pressione, resetta
-	    if (now - last_press_tick > 700) {
-	        press_count = 0;
-	    }
+        // 3. Controllo immediato: se siamo a 4 click, triggeriamo subito l'azione
+        if (btn_press_count >= 4) {
+            // CORREZIONE: Usa la funzione HAL per fermare l'interruzione e resettare lo stato
+            HAL_TIM_Base_Stop_IT(&htim2);
+            __HAL_TIM_SET_COUNTER(&htim2, 0); // Riporta il conteggio hardware a 0
 
-	    last_press_tick = now;
-	    press_count++;
-
-	    if (press_count >= 8) {
-	        HAL_UART_Transmit_IT(&huart4, (uint8_t*)GOOD_OL_TIMES, sizeof(GOOD_OL_TIMES));
-	        press_count = 0;
-	    } else {
-	        HAL_UART_Transmit_IT(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE));
-	    }
-	}
+            HAL_UART_Transmit_IT(&huart4, (uint8_t*)GOOD_OL_TIMES, sizeof(GOOD_OL_TIMES));
+            btn_press_count = 0;
+        }
+        else {
+            // 4. Se sono meno di 4 click, resetta il counter e fai ripartire in sicurezza
+            __HAL_TIM_SET_COUNTER(&htim2, 0);
+            HAL_TIM_Base_Start_IT(&htim2);
+        }
+    }
 }
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
@@ -302,6 +325,7 @@ int main(void)
   MX_UART4_Init();
   MX_SPI1_Init();
   MX_TIM3_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)joystickdata, 2);
 
@@ -511,6 +535,51 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 8399;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
