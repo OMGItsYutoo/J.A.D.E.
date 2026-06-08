@@ -154,11 +154,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     HAL_TIM_Base_Stop_IT(&htim2);
 
-    if (btn_press_count == 1)
-    {
-      HAL_UART_Transmit_IT(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE));
-    }
-    else if (btn_press_count > 1)
+    if (btn_press_count > 1)
     {
       HAL_UART_Transmit_IT(&huart4, (uint8_t*)WAVE_MESSAGE, sizeof(WAVE_MESSAGE));
     }
