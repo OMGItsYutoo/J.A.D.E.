@@ -1,6 +1,7 @@
 from picrawler import Picrawler
 from time import sleep
 import socket
+from robot_hat import Music
 
 crawler = Picrawler()
 
@@ -31,6 +32,41 @@ def wave_hand(spider):
     for coord in coords:
         spider.do_step(coord, 60)
 
+def saluto(spider):
+    coords = [
+        # stand
+        [[45, 0, -50], [45, 45, -50], [45, 45, -50], [45, 0, -50]],
+        # wave hand
+        #[[45, 45, -70], [60, 0, 120], [45, 0, -60], [45, 45, -30]],
+        [[20, 60, 120], [45, 45, -70], [45, 45, -30], [45, 0, -60]],
+        #[[45, 45, -70], [60, 0, 120], [45, 0, -60], [45, 45, -30]],
+        #[[45, 45, -70], [-20, 60, 120], [45, 0, -60], [45, 45, -30]],
+        # return to stand
+        #[[45, 45, -50], [45, 0, -30], [45, 0, -50], [45, 45, -50]],
+        #[[45, 45, -50], [45, 0, -40], [45, 0, -50], [45, 45, -50]],
+        #[[45, 45, -50], [45, 0, -50], [45, 0, -50], [45, 45, -50]],
+     ]
+
+    for coord in coords:
+        spider.do_step(coord, 60)
+
+def stop_saluto(spider):
+    coords = [
+        # stand
+        #[[45, 45, -50], [45, 0, -50], [45, 0, -50], [45, 45, -50]],
+        # wave hand
+        #[[45, 45, -70], [60, 0, 120], [45, 0, -60], [45, 45, -30]],
+        #[[-20, 60, 120], [45, 45, -70], [45, 0, -60], [45, 45, -30]],
+        #[[45, 45, -70], [60, 0, 120], [45, 0, -60], [45, 45, -30]],
+        #[[45, 45, -70], [-20, 60, 120], [45, 0, -60], [45, 45, -30]],
+        # return to stand
+        [[45, 0, -30], [45, 45, -50], [45, 45, -50], [45, 0, -50]],
+        [[45, 0, -40], [45, 45, -50], [45, 45, -50], [45, 0, -50]],
+        [[45, 0, -50], [45, 45, -50], [45, 45, -50], [45, 0, -50]],
+     ]
+
+    for coord in coords:
+        spider.do_step(coord, 60)
 
 
 def do_move(action_name):
@@ -48,6 +84,8 @@ def safe_sit():
         pass
 
 def main():
+    music = Music()
+    music.music_set_volume(50)
     try:
 
         socket_esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -58,35 +96,49 @@ def main():
 
             value, address = socket_esp.recvfrom(64) #value <=> xxxx,yyyy
             #print(value)
+                        
             try:
+                if value.decode("utf8")=='wave':
+                    wave_hand(crawler)
+                    last_move = ""
+                    print("wave")                    
+                    continue
+                elif value.decode("utf8")=='train':
+                    saluto(crawler)
+                    last_move = ""
+                    print("easter egg")
+                    music.music_play('./nostalgia.mp3')
+                    sleep(10)
+                    music.music_stop()
+                    stop_saluto(crawler)
+                    continue
+
                 valueX,valueY = value.decode("utf8").split(',')
+                
+                
                 if((" " in valueX) or (" " in valueY)):
                     raise Exception("")
                 valueX = int(valueX)
                 valueY = int(valueY)
 
-                if valueX == 0 and valueY == 0:
-                    wave_hand(crawler)
-                    last_move = ""
-
-                elif valueX >= (2048 + deadzone) and valueX <= 4095:
+                if valueX >= (2048 + deadzone) and valueX <= 4095:
                     print(value)
                     if(last_move == "f"):
-                        do_move("forward")
+                        do_move("backward")
                     last_move = "f"
                 elif valueX <= (2048 - deadzone) and valueX >= 0:
                     print(value)
                     if(last_move == "b"):
-                        do_move("backward")
+                        do_move("forward")
                     last_move = "b"  
                 elif valueY >= (2048 + deadzone) and valueY <= 4095:
                     if(last_move == "r"):
-                        do_move("turn right")
+                        do_move("turn left")
                     last_move = "r"
                     print(value)
                 elif valueY <= (2048 - deadzone) and valueY >= 0:
                     if(last_move == "l"):
-                        do_move("turn left")
+                        do_move("turn right")
                     last_move = "l"
                     print(value)
             except:

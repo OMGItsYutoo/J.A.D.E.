@@ -36,7 +36,7 @@ def main():
             
             # 2. Comprimi il frame in formato JPEG al volo (in memoria)
             # cv2.imencode restituisce una tupla (successo_operazione, immagine_codificata)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 30]
             success, encoded_img = cv2.imencode('.jpg', small_frame, encode_param)
             
             if success:
@@ -54,7 +54,7 @@ def main():
 
                 print(f"Inizio invio frame: {total_size} bytes")
 
-                sleep(0.001)
+                #sleep(0.0001)
 
                 for i in range(total_chunks):
                     start = i * 1400
@@ -75,7 +75,7 @@ def main():
             
         # 6. Pausa per limitare i Frame Per Second (FPS) 
         # Evita di saturare il processore del Pi e la banda Wi-Fi
-        sleep(0.25) # ~20 FPS teorici massimi
+        sleep(0.1) # ~20 FPS teorici massimi
 
 
 if __name__=='__main__':
